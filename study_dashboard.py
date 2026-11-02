@@ -17,6 +17,7 @@ New in v3:
   * A phone resting on the desk during calibration is ignored
 """
 
+import base64
 import os
 import time
 from datetime import datetime
@@ -233,8 +234,13 @@ class FocusMonitor:
         self.prev_active = set()
 
     def close(self):
-        self.face_mesh.close()
-        self.hands.close()
+        # Cleanup only: MediaPipe can raise while shutting down its graph, which must
+        # never break the app, so errors are ignored here.
+        for solution in (self.face_mesh, self.hands):
+            try:
+                solution.close()
+            except Exception:
+                pass
 
     def process(self, frame_bgr, cfg, phone_model=None):
         """Returns (rgb_frame, state, active_reasons).
@@ -457,6 +463,26 @@ def load_history():
     return pd.DataFrame()
 
 
+def show_frame(ph, img_rgb, mode):
+    """Show one video frame. Three ways, in case one is blocked on your setup."""
+    if mode.startswith("Separate"):
+        cv2.imshow("Study Focus Monitor", cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
+        cv2.waitKey(1)
+    elif mode.startswith("Compat"):
+        # Embed the frame directly in the page as base64, avoiding Streamlit's media files
+        ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR),
+                               [cv2.IMWRITE_JPEG_QUALITY, 75])
+        if ok:
+            b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+            ph.markdown(
+                f'<img src="data:image/jpeg;base64,{b64}" '
+                f'style="width:100%;border-radius:12px" alt="live camera">',
+                unsafe_allow_html=True,
+            )
+    else:
+        ph.image(img_rgb, channels="RGB", output_format="JPEG")
+
+
 def fmt_time(seconds):
     s = int(seconds)
     return f"{s // 60:02d}:{s % 60:02d}"
@@ -507,11 +533,12 @@ def on_recalibrate():
 
 
 def on_stop():
-    saved = save_session(ss.mon)
-    ss.mon.close()
-    ss.mon = None
+    mon = ss.mon
+    saved = save_session(mon)
+    ss.mon = None  # update the UI state first, then clean up
     ss.status = "idle"
     ss.flash = "Session saved to history." if saved else "Session too short to save."
+    mon.close()
 
 
 # ----------------------------- sidebar -------------------------------------
@@ -594,6 +621,12 @@ with st.sidebar:
     st.subheader("Other")
     sound = st.toggle("Alarm sound", True)
     show_debug = st.toggle("Show debug info under video", True)
+    video_mode = st.selectbox(
+        "Video display",
+        ["Compatibility (in page)", "Standard (st.image)", "Separate window (OpenCV)"],
+        help="If the live video is blank in the browser, try another option. "
+             "'Separate window' opens the camera view in its own desktop window.",
+    )
     cam_idx = st.number_input("Camera index", 0, 5, 0)
 
 cfg = {
@@ -741,7 +774,9 @@ if ss.status == "running":
         frame_ph.error("Could not open the camera. Close other apps using it, or change the camera index.")
         ss.status = "paused"
     else:
-        last_ui = last_chart = 0.0
+        last_ui = last_chart = last_img = 0.0
+        if video_mode.startswith("Separate"):
+            frame_ph.info("Live video is open in a separate window (check your taskbar).")
         try:
             while True:
                 ok, frame = cap.read()
@@ -757,9 +792,13 @@ if ss.status == "running":
                 else:
                     channel.stop()
 
-                frame_ph.image(img, channels="RGB")
-
                 now = time.time()
+                # Sending every frame floods the browser and the video can stay blank,
+                # so push at most ~12 frames per second, as compressed JPEG.
+                if now - last_img >= 0.08:
+                    last_img = now
+                    show_frame(frame_ph, img, video_mode)
+
                 if now - last_ui > 0.25:
                     last_ui = now
                     render_banner(state, active)
@@ -771,3 +810,8 @@ if ss.status == "running":
         finally:  # runs when Streamlit reruns (button / slider) or the loop ends
             cap.release()
             channel.stop()
+            if video_mode.startswith("Separate"):
+                try:
+                    cv2.destroyAllWindows()
+                except Exception:
+                    pass
